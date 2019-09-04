@@ -17,15 +17,21 @@ import (
 // connection) are created before the application is actually ready.
 func NewClient(o *ClientOptions) Client {
 	c := &mqttclient{opts: o, adaptor: o.Adaptor}
+	c.msgRouter, c.stopRouter = newRouter()
 	return c
 }
 
 type mqttclient struct {
-	adaptor   *espat.Device
-	conn      net.Conn
-	connected bool
-	opts      *ClientOptions
-	mid       uint16
+	adaptor         *espat.Device
+	conn            net.Conn
+	connected       bool
+	opts            *ClientOptions
+	mid             uint16
+	inbound         chan packets.ControlPacket
+	stop            chan struct{}
+	msgRouter       *router
+	stopRouter      chan bool
+	incomingPubChan chan *packets.PublishPacket
 }
 
 // AddRoute allows you to add a handler for messages on a specific topic
@@ -49,6 +55,8 @@ func (c *mqttclient) IsConnectionOpen() bool {
 
 // Connect will create a connection to the message broker.
 func (c *mqttclient) Connect() Token {
+	println("Connect()")
+
 	var err error
 
 	// make connection
@@ -69,6 +77,11 @@ func (c *mqttclient) Connect() Token {
 		return &mqtttoken{err: errors.New("invalid protocol")}
 	}
 
+	c.inbound = make(chan packets.ControlPacket)
+	c.stop = make(chan struct{})
+	c.incomingPubChan = make(chan *packets.PublishPacket)
+	c.msgRouter.matchAndDispatch(c.incomingPubChan, c.options.Order, c)
+
 	// send the MQTT connect message
 	connectPkt := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
 	connectPkt.Qos = 0
@@ -82,7 +95,7 @@ func (c *mqttclient) Connect() Token {
 		connectPkt.PasswordFlag = true
 	}
 
-	connectPkt.ClientIdentifier = c.opts.ClientID //"tinygo-client-" + randomString(10)
+	connectPkt.ClientIdentifier = c.opts.ClientID
 	connectPkt.ProtocolVersion = byte(c.opts.ProtocolVersion)
 	connectPkt.ProtocolName = "MQTT"
 	connectPkt.Keepalive = 30
@@ -101,15 +114,22 @@ func (c *mqttclient) Connect() Token {
 			if ok {
 				if ack.ReturnCode == 0 {
 					// success
-					return &mqtttoken{}
+					c.connected = true
+
+					// start processing messages
+					break
 				}
 				// otherwise something went wrong
+				println("error", packet.String())
 				return &mqtttoken{err: errors.New(packet.String())}
 			}
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
+
+	go incoming(c)
+	go processInbound(c)
 
 	c.connected = true
 	return &mqtttoken{}
@@ -148,6 +168,22 @@ func (c *mqttclient) Publish(topic string, qos byte, retained bool, payload inte
 // Subscribe starts a new subscription. Provide a MessageHandler to be executed when
 // a message is published on the topic provided.
 func (c *mqttclient) Subscribe(topic string, qos byte, callback MessageHandler) Token {
+	if !c.IsConnected() {
+		return &mqtttoken{err: errors.New("MQTT client not connected")}
+	}
+
+	sub := packets.NewControlPacket(packets.Subscribe).(*packets.SubscribePacket)
+	sub.Topics = append(sub.Topics, topic)
+	sub.Qoss = append(sub.Qoss, qos)
+
+	if callback != nil {
+		c.msgRouter.addRoute(topic, callback)
+	}
+
+	sub.MessageID = c.mid
+	c.mid++
+
+	err := sub.Write(c.conn)
 	return &mqtttoken{}
 }
 
@@ -171,18 +207,127 @@ func (c *mqttclient) OptionsReader() ClientOptionsReader {
 	return r
 }
 
-type mqtttoken struct {
-	err error
+func processInbound(c *mqttclient) {
+	for {
+		println("logic waiting for msg on ibound")
+
+		select {
+		case msg := <-c.inbound:
+
+			switch m := msg.(type) {
+			case *packets.PingrespPacket:
+				//println("received pingresp")
+				//atomic.StoreInt32(&c.pingOutstanding, 0)
+			case *packets.SubackPacket:
+				// println("received suback,", m.MessageID)
+				// token := c.getToken(m.MessageID)
+				// switch t := token.(type) {
+				// case *SubscribeToken:
+				// 	DEBUG.Println(NET, "granted qoss", m.ReturnCodes)
+				// 	for i, qos := range m.ReturnCodes {
+				// 		t.subResult[t.subs[i]] = qos
+				// 	}
+				// }
+				// token.flowComplete()
+				// c.freeID(m.MessageID)
+			case *packets.UnsubackPacket:
+				// DEBUG.Println(NET, "received unsuback, id:", m.MessageID)
+				// c.getToken(m.MessageID).flowComplete()
+				// c.freeID(m.MessageID)
+			case *packets.PublishPacket:
+				println("packet!!")
+				c.incomingPubChan <- m
+				// DEBUG.Println(NET, "received publish, msgId:", m.MessageID)
+				// DEBUG.Println(NET, "putting msg on onPubChan")
+				// switch m.Qos {
+				// case 2:
+				// 	c.incomingPubChan <- m
+				// 	DEBUG.Println(NET, "done putting msg on incomingPubChan")
+				// case 1:
+				// 	c.incomingPubChan <- m
+				// 	DEBUG.Println(NET, "done putting msg on incomingPubChan")
+				// case 0:
+				// 	select {
+				// 	case c.incomingPubChan <- m:
+				// 	case <-c.stop:
+				// 	}
+				// 	DEBUG.Println(NET, "done putting msg on incomingPubChan")
+				// }
+			case *packets.PubackPacket:
+				// DEBUG.Println(NET, "received puback, id:", m.MessageID)
+				// // c.receipts.get(msg.MsgId()) <- Receipt{}
+				// // c.receipts.end(msg.MsgId())
+				// c.getToken(m.MessageID).flowComplete()
+				// c.freeID(m.MessageID)
+			case *packets.PubrecPacket:
+				// DEBUG.Println(NET, "received pubrec, id:", m.MessageID)
+				// prel := packets.NewControlPacket(packets.Pubrel).(*packets.PubrelPacket)
+				// prel.MessageID = m.MessageID
+				// select {
+				// case c.oboundP <- &PacketAndToken{p: prel, t: nil}:
+				// case <-c.stop:
+				// }
+			case *packets.PubrelPacket:
+				// DEBUG.Println(NET, "received pubrel, id:", m.MessageID)
+				// pc := packets.NewControlPacket(packets.Pubcomp).(*packets.PubcompPacket)
+				// pc.MessageID = m.MessageID
+				// persistOutbound(c.persist, pc)
+				// select {
+				// case c.oboundP <- &PacketAndToken{p: pc, t: nil}:
+				// case <-c.stop:
+				// }
+			case *packets.PubcompPacket:
+				// DEBUG.Println(NET, "received pubcomp, id:", m.MessageID)
+				// c.getToken(m.MessageID).flowComplete()
+				// c.freeID(m.MessageID)
+			}
+		case <-c.stop:
+			println("logic stopped")
+			return
+		}
+	}
 }
 
-func (t *mqtttoken) Wait() bool {
-	return true
-}
+// read incoming messages off the wire, then send into inbound channel.
+func incoming(c *mqttclient) {
+	var err error
+	var cp packets.ControlPacket
 
-func (t *mqtttoken) WaitTimeout(time.Duration) bool {
-	return true
-}
+	println("incoming started")
 
-func (t *mqtttoken) Error() error {
-	return t.err
+	for {
+		println("aqui")
+		if cp, err = packets.ReadPacket(c.conn); err != nil {
+			println("bail out")
+			break
+		}
+		if cp != nil {
+			println("Received Message")
+			select {
+			case c.inbound <- cp:
+				// Notify keepalive logic that we recently received a packet
+				// if c.options.KeepAlive != 0 {
+				// 	c.lastReceived.Store(time.Now())
+				// }
+			case <-c.stop:
+				// This avoids a deadlock should a message arrive while shutting down.
+				// In that case the "reader" of c.ibound might already be gone
+				println("incoming dropped a received message during shutdown")
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// We received an error on read.
+	// If disconnect is in progress, swallow error and return
+	select {
+	case <-c.stop:
+		println(("incoming stopped")
+		return
+	// Not trying to disconnect, send the error to the errors channel
+	default:
+		println("incoming stopped with error", err.Error())
+		//signalError(c.errors, err)
+		return
+	}
 }
