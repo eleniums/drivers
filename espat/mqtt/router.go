@@ -136,7 +136,7 @@ func (r *router) setDefaultHandler(handler MessageHandler) {
 // takes messages off the channel, matches them against the internal route list and calls the
 // associated callback (or the defaultHandler, if one exists and no other route matched). If
 // anything is sent down the stop channel the function will end.
-func (r *router) matchAndDispatch(messages <-chan *packets.PublishPacket, order bool, client *client) {
+func (r *router) matchAndDispatch(messages <-chan *packets.PublishPacket, order bool, client *mqttclient) {
 	go func() {
 		for {
 			select {

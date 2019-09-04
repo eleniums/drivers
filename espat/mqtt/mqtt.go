@@ -80,7 +80,7 @@ func (c *mqttclient) Connect() Token {
 	c.inbound = make(chan packets.ControlPacket)
 	c.stop = make(chan struct{})
 	c.incomingPubChan = make(chan *packets.PublishPacket)
-	c.msgRouter.matchAndDispatch(c.incomingPubChan, c.options.Order, c)
+	//c.msgRouter.matchAndDispatch(c.incomingPubChan, c.opts.Order, c)
 
 	// send the MQTT connect message
 	connectPkt := packets.NewControlPacket(packets.Connect).(*packets.ConnectPacket)
@@ -106,6 +106,7 @@ func (c *mqttclient) Connect() Token {
 	}
 
 	// TODO: handle timeout
+CONNECT:
 	for {
 		packet, _ := packets.ReadPacket(c.conn)
 
@@ -117,7 +118,7 @@ func (c *mqttclient) Connect() Token {
 					c.connected = true
 
 					// start processing messages
-					break
+					break CONNECT
 				}
 				// otherwise something went wrong
 				println("error", packet.String())
@@ -125,6 +126,7 @@ func (c *mqttclient) Connect() Token {
 			}
 		}
 
+		println("Retry connect")
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -184,7 +186,7 @@ func (c *mqttclient) Subscribe(topic string, qos byte, callback MessageHandler) 
 	c.mid++
 
 	err := sub.Write(c.conn)
-	return &mqtttoken{}
+	return &mqtttoken{err: err}
 }
 
 // SubscribeMultiple starts a new subscription for multiple topics. Provide a MessageHandler to
@@ -322,12 +324,40 @@ func incoming(c *mqttclient) {
 	// If disconnect is in progress, swallow error and return
 	select {
 	case <-c.stop:
-		println(("incoming stopped")
+		println("incoming stopped")
 		return
 	// Not trying to disconnect, send the error to the errors channel
 	default:
 		println("incoming stopped with error", err.Error())
 		//signalError(c.errors, err)
 		return
+	}
+}
+
+func (c *mqttclient) ackFunc(packet *packets.PublishPacket) func() {
+	return func() {
+		switch packet.Qos {
+		case 2:
+			// pr := packets.NewControlPacket(packets.Pubrec).(*packets.PubrecPacket)
+			// pr.MessageID = packet.MessageID
+			// DEBUG.Println(NET, "putting pubrec msg on obound")
+			// select {
+			// case c.oboundP <- &PacketAndToken{p: pr, t: nil}:
+			// case <-c.stop:
+			// }
+			// DEBUG.Println(NET, "done putting pubrec msg on obound")
+		case 1:
+			// pa := packets.NewControlPacket(packets.Puback).(*packets.PubackPacket)
+			// pa.MessageID = packet.MessageID
+			// DEBUG.Println(NET, "putting puback msg on obound")
+			// persistOutbound(c.persist, pa)
+			// select {
+			// case c.oboundP <- &PacketAndToken{p: pa, t: nil}:
+			// case <-c.stop:
+			// }
+			// DEBUG.Println(NET, "done putting puback msg on obound")
+		case 0:
+			// do nothing, since there is no need to send an ack packet back
+		}
 	}
 }
